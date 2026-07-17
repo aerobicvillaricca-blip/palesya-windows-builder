@@ -1,0 +1,86 @@
+name: Build Palesya Windows
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Tag privato da compilare (es. v1.2.0-pilot.34)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: palesya-windows-${{ inputs.release_tag }}
+  cancel-in-progress: false
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout private Palesya source
+        uses: actions/checkout@v5
+        with:
+          repository: aerobicvillaricca-blip/Gestionalepalestra
+          ref: ${{ inputs.release_tag }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Record private source commit
+        shell: pwsh
+        run: |
+          $sourceCommit = (git rev-parse HEAD).Trim()
+          "PALESYA_SOURCE_COMMIT=$sourceCommit" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "Building private source commit $sourceCommit"
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install build dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-dev.txt
+
+      - name: Ensure Inno Setup
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup --yes --no-progress
+          }
+          if (-not (Test-Path $iscc)) {
+            throw "Inno Setup 6 non disponibile sul runner."
+          }
+
+      - name: Build signed Windows installer
+        shell: pwsh
+        env:
+          PALESYA_UPDATE_SIGNING_KEY: ${{ secrets.PALESYA_UPDATE_SIGNING_KEY }}
+          PALESYA_VERSION: ${{ inputs.release_tag }}
+          PALESYA_UPDATE_BASE_URL: https://palesya-updates.palesya.workers.dev
+        run: .\packaging\build_windows.ps1
+
+      - name: Smoke test installer and installed application
+        shell: pwsh
+        env:
+          PALESYA_VERSION: ${{ inputs.release_tag }}
+        run: .\scripts\test_windows_payload.ps1
+
+      - name: Upload verified installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: Palesya-windows-x64-${{ inputs.release_tag }}
+          path: |
+            dist/PalesyaSetup.exe
+            dist/PalesyaSetup.exe.sha256
+            dist/manifest-windows-x64-stable.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
