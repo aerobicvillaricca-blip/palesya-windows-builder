@@ -75,7 +75,8 @@ jobs:
           test -x dist/linux-package/Palesya/Palesya
           test -x dist/linux-package/PalesyaUpdater
           test -x dist/linux-package/install_linux.sh
-          tar -tzf dist/Palesya-linux-x64.tar.gz | grep -qx 'Palesya/Palesya'
+          tar -tzf dist/Palesya-linux-x64.tar.gz > "$RUNNER_TEMP/linux-package-contents.txt"
+          grep -qx 'Palesya/Palesya' "$RUNNER_TEMP/linux-package-contents.txt"
           python - <<'PY'
           import hashlib, json, os
           from pathlib import Path
