@@ -1,0 +1,145 @@
+name: Build Palesya Linux
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Tag privato da compilare (es. v1.2.0-pilot.34)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: palesya-linux-${{ inputs.release_tag }}
+  cancel-in-progress: false
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout private Palesya source
+        uses: actions/checkout@v5
+        with:
+          repository: aerobicvillaricca-blip/Gestionalepalestra
+          ref: ${{ inputs.release_tag }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Record private source commit
+        shell: bash
+        run: |
+          echo "PALESYA_SOURCE_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-dev.txt
+
+      - name: Build signed Linux package
+        env:
+          PALESYA_UPDATE_SIGNING_KEY: ${{ secrets.PALESYA_UPDATE_SIGNING_KEY }}
+          PALESYA_VERSION: ${{ inputs.release_tag }}
+          PALESYA_UPDATE_BASE_URL: https://palesya-updates.palesya.workers.dev
+        run: |
+          python packaging/write_build_info.py
+          python -m PyInstaller --noconfirm --clean packaging/Palesya.spec
+          python -m PyInstaller --noconfirm --clean packaging/PalesyaUpdater.spec
+          mkdir -p dist/linux-package
+          cp -R dist/Palesya dist/linux-package/Palesya
+          cp dist/PalesyaUpdater dist/linux-package/PalesyaUpdater
+          cp packaging/install_linux.sh dist/linux-package/install_linux.sh
+          chmod +x dist/linux-package/Palesya/Palesya dist/linux-package/PalesyaUpdater dist/linux-package/install_linux.sh
+          tar -C dist/linux-package -czf dist/Palesya-linux-x64.tar.gz Palesya PalesyaUpdater install_linux.sh
+          (cd dist && sha256sum Palesya-linux-x64.tar.gz > Palesya-linux-x64.tar.gz.sha256)
+          python packaging/build_update_manifest.py dist/Palesya-linux-x64.tar.gz \
+            --version "$PALESYA_VERSION" --platform linux-x64 --channel stable \
+            --url "$PALESYA_UPDATE_BASE_URL/releases/$PALESYA_VERSION/linux-x64/Palesya-linux-x64.tar.gz" \
+            --output dist/manifest-linux-x64-stable.json
+
+      - name: Smoke test Linux payload and signed manifest
+        shell: bash
+        env:
+          PALESYA_VERSION: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          test -x dist/linux-package/Palesya/Palesya
+          test -x dist/linux-package/PalesyaUpdater
+          test -x dist/linux-package/install_linux.sh
+          tar -tzf dist/Palesya-linux-x64.tar.gz | grep -qx 'Palesya/Palesya'
+          python - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          import updates
+
+          artifact = Path("dist/Palesya-linux-x64.tar.gz")
+          envelope = json.loads(Path("dist/manifest-linux-x64-stable.json").read_text())
+          key = Path("packaging/update-public-key.txt").read_text().strip()
+          manifest = updates.verify_manifest(envelope, key)
+          assert manifest["platform"] == "linux-x64"
+          assert manifest["version"] == os.environ["PALESYA_VERSION"]
+          assert manifest["source_commit"] == os.environ["PALESYA_SOURCE_COMMIT"]
+          assert manifest["size"] == artifact.stat().st_size
+          assert manifest["sha256"] == hashlib.sha256(artifact.read_bytes()).hexdigest()
+          PY
+          data_dir="$RUNNER_TEMP/palesya-linux-smoke"
+          mkdir -p "$data_dir"
+          : > "$data_dir/gymflow.sqlite"
+          PALESYA_HEADLESS=1 \
+          PALESYA_ENV=local \
+          PALESYA_AUTH_REQUIRED=0 \
+          PALESYA_FLEET_ENABLED=0 \
+          PALESYA_RFID_AUTOSTART=0 \
+          PALESYA_DATA_DIR="$data_dir" \
+          PALESYA_DB="$data_dir/gymflow.sqlite" \
+          PALESYA_PORT=18083 \
+            dist/linux-package/Palesya/Palesya &
+          app_pid=$!
+          trap 'kill "$app_pid" 2>/dev/null || true' EXIT
+          for attempt in $(seq 1 120); do
+            if ! kill -0 "$app_pid" 2>/dev/null; then
+              echo "Il payload Linux si e terminato durante l'avvio" >&2
+              exit 1
+            fi
+            if curl --fail --silent http://127.0.0.1:18083/health > "$RUNNER_TEMP/health.json"; then
+              break
+            fi
+            sleep 0.25
+          done
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          health = json.loads(Path(os.environ["RUNNER_TEMP"], "health.json").read_text())
+          assert health["status"] == "ok"
+          assert health["database"] == "ok"
+          PY
+          curl --fail --silent http://127.0.0.1:18083/ready | grep -q 'ready'
+          curl --fail --silent http://127.0.0.1:18083/ > /dev/null
+          curl --fail --silent http://127.0.0.1:18083/activation > /dev/null
+          curl --fail --silent http://127.0.0.1:18083/soci > /dev/null
+          curl --fail --silent http://127.0.0.1:18083/accessi > /dev/null
+          kill "$app_pid"
+          wait "$app_pid" || true
+          trap - EXIT
+          echo "Linux smoke PASS: payload, health, ready, database, UI e manifest firmato"
+
+      - name: Upload verified Linux package
+        uses: actions/upload-artifact@v4
+        with:
+          name: Palesya-linux-x64-${{ inputs.release_tag }}
+          path: |
+            dist/Palesya-linux-x64.tar.gz
+            dist/Palesya-linux-x64.tar.gz.sha256
+            dist/manifest-linux-x64-stable.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
